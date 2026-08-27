@@ -1,0 +1,19 @@
+# dsh-tool-kubernetes 组合示例
+# 用法:在 dsh 的组合配置中引入本插件(示例片段,按你的部署组合调整)
+#
+# 方式一:从 GitHub 直接加载(无需发布 npm)
+- name: 'github:LJH-snow/dsh-tool-kubernetes'
+# 方式二:发布到 npm 后
+# - name: '@libai168/dsh-tool-kubernetes'
+  config:
+    # 可选 kubeconfig 路径;默认读取 $KUBECONFIG 或 ~/.kube/config
+    # kubeconfig: '/Users/you/.kube/config'
+    # 可选 kubeconfig context;默认 current-context
+    # context: 'prod'
+    # 可选默认 namespace;未设置时使用 context namespace
+    namespace: 'team'
+    # 写操作默认关闭;确认权限后再开启
+    allowWrite: true
+    # 可选写操作 namespace 白名单;为空表示 allowWrite 后所有 namespace 都可写
+    writeNamespaces:
+      - team
