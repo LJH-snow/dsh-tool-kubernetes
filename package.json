@@ -46,6 +46,7 @@
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
+    "awesome-dsh-plugin",
     "cordis",
     "kubernetes",
     "k8s",
