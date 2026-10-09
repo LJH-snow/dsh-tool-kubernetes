@@ -19,6 +19,14 @@ export interface KubernetesClientOptions {
   allowWrite?: boolean
   /** Optional namespace allowlist for write tools. Empty means every namespace is allowed when allowWrite is true. */
   writeNamespaces?: string[]
+  /** Optional Kubernetes kind allowlist for write tools. Sensitive and cluster-scoped kinds require an explicit entry. */
+  writeKinds?: string[]
+  /** Maximum number of lines returned by readPodLog. */
+  logMaxLines?: number
+  /** Maximum UTF-8 bytes returned by readPodLog. */
+  logMaxBytes?: number
+  /** Timeout in milliseconds for a pod log API request. 0 disables the timeout. */
+  logTimeoutMs?: number
   /** Test-only API injection. */
   objectApi?: KubernetesObjectApiLike
   /** Test-only Core v1 API injection for pod logs. */
@@ -165,19 +173,83 @@ export class KubernetesError extends Error {
 const NAMESPACED_KINDS = new Set([
   'ConfigMap',
   'CronJob',
+  'ControllerRevision',
+  'DaemonSet',
   'Deployment',
+  'Endpoints',
+  'EndpointSlice',
+  'Event',
+  'HorizontalPodAutoscaler',
   'Ingress',
   'Job',
+  'Lease',
+  'LimitRange',
+  'NetworkPolicy',
   'Pod',
+  'PodDisruptionBudget',
+  'PodTemplate',
+  'PersistentVolumeClaim',
   'ReplicaSet',
+  'ReplicationController',
+  'ResourceQuota',
   'Secret',
   'Service',
   'ServiceAccount',
   'StatefulSet',
+  'Role',
+  'RoleBinding',
 ])
+
+const CLUSTER_SCOPED_KINDS = new Set([
+  'APIService',
+  'CSIDriver',
+  'CSINode',
+  'CertificateSigningRequest',
+  'ClusterRole',
+  'ClusterRoleBinding',
+  'ComponentStatus',
+  'CustomResourceDefinition',
+  'FlowSchema',
+  'MutatingWebhookConfiguration',
+  'Namespace',
+  'Node',
+  'PersistentVolume',
+  'PriorityClass',
+  'PriorityLevelConfiguration',
+  'RuntimeClass',
+  'SelfSubjectAccessReview',
+  'SelfSubjectRulesReview',
+  'StorageClass',
+  'StorageVersion',
+  'SubjectAccessReview',
+  'TokenReview',
+  'ValidatingWebhookConfiguration',
+  'VolumeAttachment',
+])
+
+const SENSITIVE_WRITE_KINDS = new Set([
+  'ClusterRole',
+  'ClusterRoleBinding',
+  'Role',
+  'RoleBinding',
+  'Secret',
+  'ServiceAccount',
+])
+
+const DEFAULT_LOG_MAX_LINES = 1_000
+const DEFAULT_LOG_MAX_BYTES = 128 * 1024
+const DEFAULT_LOG_TIMEOUT_MS = 15_000
 
 function isNamespacedKind(kind: string): boolean {
   return NAMESPACED_KINDS.has(kind)
+}
+
+type ResourceScope = 'namespaced' | 'cluster' | 'unknown'
+
+function resourceScope(namespace: string, kind: string): ResourceScope {
+  if (isNamespacedKind(kind) || namespace.length > 0) return 'namespaced'
+  if (CLUSTER_SCOPED_KINDS.has(kind)) return 'cluster'
+  return 'unknown'
 }
 
 function errorStatus(error: unknown): number | null {
@@ -264,11 +336,34 @@ export class KubernetesClient {
     return !allowed || allowed.length === 0 || allowed.includes(namespace)
   }
 
-  writeDisabledReason(namespace: string): string {
+  canWriteResource(namespace: string, kind: string): boolean {
+    if (!this.options.allowWrite) return false
+    const scope = resourceScope(namespace, kind)
+    if (scope === 'namespaced' && !this.canWrite(namespace)) return false
+    if (scope === 'unknown' && Boolean(this.options.writeNamespaces?.length)) return false
+    const allowedKinds = this.options.writeKinds
+    if (allowedKinds && allowedKinds.length > 0) return allowedKinds.includes(kind)
+    return scope === 'namespaced' && !SENSITIVE_WRITE_KINDS.has(kind)
+  }
+
+  writeDisabledReason(namespace: string, kind?: string): string {
     if (!this.options.allowWrite) {
       return 'Kubernetes write tools are disabled. Set allowWrite: true in the plugin config to enable them.'
     }
-    return `Write access is not allowed for namespace "${namespace}". Add it to writeNamespaces in the plugin config.`
+    const scope = kind ? resourceScope(namespace, kind) : 'namespaced'
+    if (kind && scope === 'namespaced' && !this.canWrite(namespace)) {
+      return 'Write access is not allowed for namespace "' + namespace + '". Add it to writeNamespaces in the plugin config.'
+    }
+    if (kind && scope === 'unknown' && this.options.writeNamespaces?.length) {
+      return 'Namespace must be specified for unknown Kubernetes kind "' + kind + '" when writeNamespaces is configured.'
+    }
+    if (kind && (scope !== 'namespaced' || SENSITIVE_WRITE_KINDS.has(kind))) {
+      return 'Writes for Kubernetes kind "' + kind + '" are disabled by default because it is ' + (scope === 'namespaced' ? 'sensitive' : scope === 'cluster' ? 'cluster-scoped' : 'unknown-scope') + '. Add "' + kind + '" to writeKinds in the plugin config to explicitly allow it.'
+    }
+    if (kind && this.options.writeKinds && this.options.writeKinds.length > 0 && !this.options.writeKinds.includes(kind)) {
+      return 'Write access is not allowed for Kubernetes kind "' + kind + '". Add it to writeKinds in the plugin config.'
+    }
+    return 'Write access is not allowed for namespace "' + namespace + '". Add it to writeNamespaces in the plugin config.'
   }
 
   async listResources<T = any>(request: ListRequest): Promise<{ items: T[] }> {
@@ -307,7 +402,7 @@ export class KubernetesClient {
   }
 
   async readPodLog(namespace: string, name: string, options: PodLogOptions = {}): Promise<string> {
-    return this.coreApi().readNamespacedPodLog({
+    const request = this.coreApi().readNamespacedPodLog({
       name,
       namespace,
       container: options.container,
@@ -315,10 +410,28 @@ export class KubernetesClient {
       timestamps: options.timestamps,
       previous: options.previous,
     })
+    const timeoutMs = normalizeTimeout(this.options.logTimeoutMs, DEFAULT_LOG_TIMEOUT_MS)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let logs: string
+    try {
+      logs = timeoutMs > 0
+        ? await Promise.race([
+          request,
+          new Promise<string>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Kubernetes pod log request timed out after ' + timeoutMs + ' ms.')), timeoutMs)
+          }),
+        ])
+        : await request
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+    const maxLines = normalizePositiveLimit(this.options.logMaxLines, DEFAULT_LOG_MAX_LINES)
+    const maxBytes = normalizePositiveLimit(this.options.logMaxBytes, DEFAULT_LOG_MAX_BYTES)
+    return limitLogOutput(redactLogText(logs), maxLines, maxBytes)
   }
 
   async scaleResource(namespace: string, apiVersion: string, kind: string, name: string, replicas: number): Promise<WriteResult> {
-    if (!this.canWrite(namespace)) return { ok: false, reason: this.writeDisabledReason(namespace) }
+    if (!this.canWriteResource(namespace, kind)) return { ok: false, reason: this.writeDisabledReason(namespace, kind) }
     try {
       const updated = await this.api().patch({
         apiVersion,
@@ -333,7 +446,7 @@ export class KubernetesClient {
   }
 
   async restartDeployment(namespace: string, name: string): Promise<WriteResult> {
-    if (!this.canWrite(namespace)) return { ok: false, reason: this.writeDisabledReason(namespace) }
+    if (!this.canWriteResource(namespace, 'Deployment')) return { ok: false, reason: this.writeDisabledReason(namespace, 'Deployment') }
     try {
       await this.api().patch({
         apiVersion: 'apps/v1',
@@ -361,7 +474,7 @@ export class KubernetesClient {
     container: string,
     image: string,
   ): Promise<WriteResult> {
-    if (!this.canWrite(namespace)) return { ok: false, reason: this.writeDisabledReason(namespace) }
+    if (!this.canWriteResource(namespace, 'Deployment')) return { ok: false, reason: this.writeDisabledReason(namespace, 'Deployment') }
     try {
       await this.api().patch({
         apiVersion: 'apps/v1',
@@ -401,7 +514,7 @@ export class KubernetesClient {
   }
 
   async rolloutUndoDeployment(namespace: string, name: string, revision?: number): Promise<WriteResult & { fromRevision?: string; toRevision?: string }> {
-    if (!this.canWrite(namespace)) return { ok: false, reason: this.writeDisabledReason(namespace) }
+    if (!this.canWriteResource(namespace, 'Deployment')) return { ok: false, reason: this.writeDisabledReason(namespace, 'Deployment') }
     try {
       const deployment = await this.readResource<any>({ apiVersion: 'apps/v1', kind: 'Deployment', namespace, name })
       const currentRevision = Number(deployment.metadata?.annotations?.['deployment.kubernetes.io/revision'] ?? 0)
@@ -458,13 +571,13 @@ export class KubernetesClient {
     if (specs.length === 0) return { ok: false, reason: 'No Kubernetes manifests found in the input.' }
 
     for (const spec of specs) {
-      this.applyDefaultNamespace(spec)
-      const namespace = spec.metadata?.namespace ?? ''
-      if (!this.canWrite(namespace)) {
-        return { ok: false, reason: this.writeDisabledReason(namespace) }
-      }
       if (!spec.kind || !spec.apiVersion || !spec.metadata?.name) {
         return { ok: false, reason: 'Every manifest must define apiVersion, kind, and metadata.name.' }
+      }
+      this.applyDefaultNamespace(spec)
+      const namespace = spec.metadata?.namespace ?? ''
+      if (!this.canWriteResource(namespace, spec.kind)) {
+        return { ok: false, reason: this.writeDisabledReason(namespace, spec.kind) }
       }
     }
 
@@ -577,4 +690,59 @@ function parseManifests(input: string): KubernetesObject[] {
   return loadAllYaml(input, { json: true })
     .filter((value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value))
     .map(value => value as unknown as KubernetesObject)
+}
+
+function normalizePositiveLimit(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || value === undefined) return fallback
+  return Math.max(1, Math.floor(value))
+}
+
+function normalizeTimeout(value: number | undefined, fallback: number): number {
+  if (value === 0) return 0
+  if (!Number.isFinite(value) || value === undefined) return fallback
+  return Math.max(1, Math.floor(value))
+}
+
+function redactLogText(value: string): string {
+  let text = value
+  text = text.replace(/(\bBearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
+  const lines = text.split(/\r?\n/)
+  let sensitiveBlockIndent = -1
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const indent = line.match(/^\s*/)?.[0].length ?? 0
+    if (sensitiveBlockIndent >= 0) {
+      if (!line.trim()) continue
+      if (indent > sensitiveBlockIndent) {
+        lines[index] = line.slice(0, indent) + '[REDACTED]'
+        continue
+      }
+      sensitiveBlockIndent = -1
+    }
+    const blockKey = line.match(/^(\s*)(?:-\s*)?["']?secure[_-]?json(?:data|fields)?["']?\s*:/i)
+    if (!blockKey) continue
+    const colon = line.indexOf(':')
+    const valuePart = line.slice(colon + 1).trim()
+    lines[index] = line.slice(0, colon + 1) + ' [REDACTED]'
+    if (!valuePart || /^[|>]/.test(valuePart)) {
+      sensitiveBlockIndent = blockKey[1].length
+    } else if ((valuePart.startsWith('{') && !valuePart.includes('}')) || (valuePart.startsWith('[') && !valuePart.includes(']'))) {
+      sensitiveBlockIndent = blockKey[1].length
+    }
+  }
+  text = lines.join('\n')
+  const keyValue = /((?:^|[,{\s])["']?(?:credential|password|passwd|secret|token|bearer(?:[_-]?token)?|api[_-]?key|access[_-]?key|client[_-]?(?:secret|certificate|cert|key)|private[_-]?(?:key|certificate|cert)|tls[_-]?(?:auth|certificate|cert|key)|http[_-]?header[_-]?value\d*|authorization|basic[_-]?auth)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;}\]]+)/gi
+  text = text.replace(keyValue, '$1[REDACTED]')
+  text = text.replace(/([?&](?:credential|password|passwd|secret|token|bearer(?:[_-]?token)?|api[_-]?key|access[_-]?key|client[_-]?(?:secret|certificate|cert|key)|private[_-]?(?:key|certificate|cert)|tls[_-]?(?:auth|certificate|cert|key)|http[_-]?header[_-]?value\d*|authorization|basic[_-]?auth)=)[^&#\s]+/gi, '$1[REDACTED]')
+  text = text.replace(/(\b[a-z][a-z\d+.-]*:\/\/)[^/\s:@]+:[^@\s/]+@/gi, '$1[REDACTED]:[REDACTED]@')
+  return text
+}
+
+function limitLogOutput(value: string, maxLines: number, maxBytes: number): string {
+  const lines = value.split(/\r?\n/).slice(0, maxLines)
+  const limited = lines.join('\n')
+  if (Buffer.byteLength(limited, 'utf8') <= maxBytes) return limited
+  let result = Buffer.from(limited, 'utf8').subarray(0, maxBytes).toString('utf8')
+  while (result && Buffer.byteLength(result, 'utf8') > maxBytes) result = result.slice(0, -1)
+  return result
 }

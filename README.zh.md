@@ -45,6 +45,12 @@ npm install /path/to/dsh-tool-kubernetes
     # 可选写操作 namespace 白名单；为空表示 allowWrite 后所有 namespace 都可写
     writeNamespaces:
       - team
+    # 可选 kind 白名单；集群级、RBAC、Secret、ServiceAccount 写入必须显式加入
+    # writeKinds: [Deployment, StatefulSet]
+    # 可选客户端 Pod 日志限制
+    # logMaxLines: 1000
+    # logMaxBytes: 131072
+    # logTimeoutMs: 15000
 ```
 
 完整示例见 [examples/cordis.yml](examples/cordis.yml)。
@@ -91,10 +97,11 @@ npm install /path/to/dsh-tool-kubernetes
 - Kubernetes 认证来自 kubeconfig 路径、`$KUBECONFIG`、`~/.kube/config` 或集群内 ServiceAccount 文件，由官方 Kubernetes Client 解析。
 - 配置缺失时正常返回 `{ connected: false, reason }`，而不是在普通工具调用中抛错。
 - 资源不存在返回 `{ found: false }`；写操作失败返回 `{ ok: false, reason }`。
-- 写工具默认关闭；`allowWrite: true` 开启，`writeNamespaces` 作为 namespace 白名单。
-- `k8s_apply_manifest` 对每个对象都套用同一写门禁，包括 Namespace、Node 这类集群级 manifest。
 - Secret 工具只返回 key 名称，不返回 Secret 值。
-- 列表 limit 钳制为 1-100（默认 20）；Pod 日志 tailLines 钳制为 1-500（默认 200）。
+- 写工具默认关闭；`allowWrite: true` 开启，`writeNamespaces` 作为 namespace 白名单，`writeKinds` 作为明确的 kind 白名单。
+- 集群级、RBAC、`Secret`、`ServiceAccount` 写入默认拒绝；必须把精确 kind 加入 `writeKinds` 才能显式开启。
+- `k8s_apply_manifest` 会在任何 API 请求前检查 namespace 和 kind，包括 Namespace、Node 等集群级 manifest。
+- 列表 limit 钳制为 1-100（默认 20）；Pod 日志 tailLines 钳制为 1-500（默认 200），客户端还会应用 15 秒超时、递归脱敏，并按 `logMaxLines`/`logMaxBytes` 限制输出（默认 1000 行/128 KiB）。
 
 ## 开发
 

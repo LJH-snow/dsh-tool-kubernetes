@@ -127,6 +127,156 @@ describe('KubernetesClient', () => {
     })
   })
 
+  it('redacts pod log credentials and enforces line and byte limits in the client', async () => {
+    const core = {
+      readNamespacedPodLog: vi.fn(async () => [
+        'token=top-secret password: hunter2',
+        'Authorization: Bearer abc123',
+        'secret: hidden',
+        'a'.repeat(80),
+      ].join('\n')),
+    }
+    const client = new KubernetesClient({
+      coreV1Api: core,
+      objectApi: objectApi(),
+      logMaxLines: 2,
+      logMaxBytes: 80,
+    })
+
+    const result = await client.readPodLog('team', 'api-0')
+
+    expect(result).toContain('[REDACTED]')
+    expect(result).not.toContain('top-secret')
+    expect(result).not.toContain('hunter2')
+    expect(result).not.toContain('abc123')
+    expect(result).not.toContain('hidden')
+    expect(result.split('\n').length).toBeLessThanOrEqual(2)
+    expect(Buffer.byteLength(result, 'utf8')).toBeLessThanOrEqual(80)
+  })
+
+  it('redacts extended credential fields and keeps UTF-8 byte limits exact', async () => {
+    const core = {
+      readNamespacedPodLog: vi.fn(async () => [
+        'secureJsonData:',
+        '  providerSpecificField: raw-log-secret',
+        'secureJsonData: { providerSpecificField: inline-log-secret }',
+        'secureJsonData: |-',
+        '  scalar-log-secret',
+        'httpHeaderValue1: header-secret',
+        'tlsAuth: tls-secret',
+        'password: "value with spaces"',
+        'url=https://user:pass@example.test/path',
+      ].join('\n')),
+    }
+    const client = new KubernetesClient({
+      coreV1Api: core,
+      objectApi: objectApi(),
+      logMaxBytes: 1024,
+    })
+
+    const result = await client.readPodLog('team', 'api-0')
+
+    expect(result).not.toMatch(/raw-log-secret|inline-log-secret|scalar-log-secret|header-secret|tls-secret|value with spaces|user:pass/)
+
+    const unicodeClient = new KubernetesClient({
+      coreV1Api: { readNamespacedPodLog: vi.fn(async () => '中文日志') },
+      objectApi: objectApi(),
+      logMaxBytes: 1,
+    })
+    const unicodeResult = await unicodeClient.readPodLog('team', 'api-0')
+    expect(Buffer.byteLength(unicodeResult, 'utf8')).toBeLessThanOrEqual(1)
+  })
+
+  it('times out a pod log request in the client', async () => {
+    const core = {
+      readNamespacedPodLog: vi.fn(() => new Promise<string>(() => {})),
+    }
+    const client = new KubernetesClient({
+      coreV1Api: core,
+      objectApi: objectApi(),
+      logTimeoutMs: 5,
+    })
+
+    await expect(client.readPodLog('team', 'api-0')).rejects.toThrow(/timed out/i)
+  })
+
+  it('rejects sensitive and cluster-scoped writes unless their kinds are explicitly allowed', async () => {
+    const api = objectApi()
+    const client = new KubernetesClient({ allowWrite: true, objectApi: api })
+
+    expect(client.canWriteResource('team', 'Secret')).toBe(false)
+    expect(client.canWriteResource('', 'Namespace')).toBe(false)
+    expect(client.canWriteResource('team', 'Deployment')).toBe(true)
+    expect((await client.applyManifest(`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox
+`)).reason).toContain('cluster-scoped')
+
+    const allowed = new KubernetesClient({
+      allowWrite: true,
+      writeKinds: ['Namespace'],
+      objectApi: objectApi({ create: vi.fn(async spec => spec) }),
+    })
+    const result = await allowed.applyManifest(`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox
+`)
+    expect(result).toMatchObject({ ok: true, applied: 1 })
+  })
+
+  it('keeps namespaced RBAC manifests inside the namespace allowlist', async () => {
+    const api = objectApi({
+      create: vi.fn(async spec => spec),
+    })
+    const client = new KubernetesClient({
+      allowWrite: true,
+      writeNamespaces: ['team'],
+      writeKinds: ['Role', 'RoleBinding'],
+      namespace: 'team',
+      objectApi: api,
+    })
+
+    expect(client.canWriteResource('other', 'Role')).toBe(false)
+    expect(client.canWriteResource('team', 'Role')).toBe(true)
+    expect(client.canWriteResource('other', 'RoleBinding')).toBe(false)
+
+    const result = await client.applyManifest(`
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reader
+  namespace: other
+rules: []
+`)
+
+    expect(result).toMatchObject({ ok: false })
+    expect(String(result.reason)).toMatch(/namespace/i)
+    expect(api.create).not.toHaveBeenCalled()
+  })
+
+  it('requires an explicit namespace for unknown kinds when a namespace allowlist is configured', async () => {
+    const api = objectApi()
+    const client = new KubernetesClient({
+      allowWrite: true,
+      writeNamespaces: ['team'],
+      writeKinds: ['Widget'],
+      namespace: 'team',
+      objectApi: api,
+    })
+
+    expect(client.canWriteResource('', 'Widget')).toBe(false)
+    expect(client.canWriteResource('team', 'Widget')).toBe(true)
+    const result = await client.applyManifest('apiVersion: example.test/v1\nkind: Widget\nmetadata:\n  name: custom\n')
+
+    expect(result).toMatchObject({ ok: false })
+    expect(String(result.reason)).toMatch(/namespace/i)
+    expect(api.create).not.toHaveBeenCalled()
+  })
+
   it('adds the plugin default namespace to known namespaced manifest objects', async () => {
     const api = objectApi({
       read: vi.fn(async () => {
@@ -171,7 +321,7 @@ metadata:
     expect(api.create).not.toHaveBeenCalled()
   })
 
-  it('allows cluster-scoped manifests when write tools are enabled without an allowlist', async () => {
+  it('rejects cluster-scoped manifests by default even when write tools are enabled', async () => {
     const api = objectApi({
       read: vi.fn(async () => {
         throw new ApiException(404, 'missing', {}, {})
@@ -185,7 +335,8 @@ kind: Namespace
 metadata:
   name: sandbox
 `)
-    expect(result).toMatchObject({ ok: true, applied: 1, items: [{ name: 'sandbox', action: 'created' }] })
-    expect(api.create).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({ ok: false })
+    expect(String(result.reason)).toContain('cluster-scoped')
+    expect(api.create).not.toHaveBeenCalled()
   })
 })
