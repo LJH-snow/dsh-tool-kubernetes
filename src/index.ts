@@ -17,6 +17,14 @@ export interface KubernetesPluginConfig {
   allowWrite?: boolean
   /** Optional namespace allowlist for write tools. Empty means every namespace is allowed when allowWrite is true. */
   writeNamespaces?: string[]
+  /** Optional Kubernetes kind allowlist. Sensitive and cluster-scoped kinds require an explicit entry. */
+  writeKinds?: string[]
+  /** Maximum pod log lines returned by the client. */
+  logMaxLines?: number
+  /** Maximum pod log UTF-8 bytes returned by the client. */
+  logMaxBytes?: number
+  /** Pod log request timeout in milliseconds; 0 disables it. */
+  logTimeoutMs?: number
 }
 
 export function apply(ctx: Context, config: KubernetesPluginConfig = {}) {

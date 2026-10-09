@@ -17,3 +17,9 @@
     # 可选写操作 namespace 白名单;为空表示 allowWrite 后所有 namespace 都可写
     writeNamespaces:
       - team
+    # 集群级、RBAC、Secret、ServiceAccount 写入必须显式加入 kind 白名单
+    # writeKinds: [Deployment, StatefulSet]
+    # Pod 日志客户端上限
+    # logMaxLines: 1000
+    # logMaxBytes: 131072
+    # logTimeoutMs: 15000

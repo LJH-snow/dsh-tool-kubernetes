@@ -45,6 +45,12 @@ Load the plugin in a dsh composition config (`cordis.yml`):
     # Optional namespace allowlist. Empty means every namespace is allowed when allowWrite is true.
     writeNamespaces:
       - team
+    # Optional kind allowlist. Required to opt in to cluster-scoped, RBAC, Secret, or ServiceAccount writes.
+    # writeKinds: [Deployment, StatefulSet]
+    # Optional client-side pod log limits.
+    # logMaxLines: 1000
+    # logMaxBytes: 131072
+    # logTimeoutMs: 15000
 ```
 
 Full example: [examples/cordis.yml](examples/cordis.yml).
@@ -91,10 +97,11 @@ Full example: [examples/cordis.yml](examples/cordis.yml).
 - Kubernetes access comes from a kubeconfig path, `$KUBECONFIG`, `~/.kube/config`, or in-cluster service account files resolved by the official Kubernetes client.
 - Missing configuration returns `{ connected: false, reason }` instead of throwing during normal tool calls.
 - Missing resources return `{ found: false }`; write operations return `{ ok: false, reason }` for gating or API failures.
-- Write tools are disabled unless `allowWrite: true`. When `writeNamespaces` is set, it acts as a namespace allowlist.
-- `k8s_apply_manifest` applies the same write gate to every object, including cluster-scoped manifests such as Namespace or Node.
+- Write tools are disabled unless `allowWrite: true`. When `writeNamespaces` is set, it acts as a namespace allowlist; `writeKinds` is an explicit kind allowlist.
+- Cluster-scoped, RBAC, `Secret`, and `ServiceAccount` writes are denied by default. Add the exact kind to `writeKinds` to opt in.
+- `k8s_apply_manifest` validates the namespace and kind gate before any API request, including cluster-scoped manifests such as Namespace or Node.
 - `k8s_list_secrets` and `k8s_get_secret` intentionally return key names only; Secret values are not returned.
-- List limits are clamped to 1-100 (default 20). Pod log tail lines are clamped to 1-500 (default 200).
+- List limits are clamped to 1-100 (default 20). Pod log tail lines are clamped to 1-500 (default 200), then the client applies a 15-second timeout, redacts credentials, and caps output by `logMaxLines`/`logMaxBytes` (defaults 1000/128 KiB).
 
 ## Development
 
